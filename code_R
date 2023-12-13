@@ -1,0 +1,148 @@
+hotelarstwo_df <- read.csv(choose.files(), sep = ";")
+#install.packages("fpp3") #odpalamy tę linijke jeżeli nie mamy fpp3
+library(fpp3) 
+
+hotelarstwo_df<- hotelarstwo_df %>% t() %>%  as.data.frame()%>% tibble::rownames_to_column(var = "rok")
+hotelarstwo_df <- hotelarstwo_df[c(-1,-2,-183),]
+
+sek_year <- rep(seq(2009, 2023, by =1),12)
+month_sequence <- rep(seq(1, 12), each = 15)
+
+sek_month <- month_sequence %>% as.character()
+sek_month <- ifelse(nchar(sek_month)== 1, paste0("0",sek_month), sek_month)
+new_date <- paste(sek_year, sek_month, sep = "-")
+
+hotelarstwo_df <- cbind(hotelarstwo_df, new_date)
+
+hotelarstwo_df <- hotelarstwo_df %>% select(-1) %>% 
+  rename(n_pokoje = V1, Date = new_date) %>% 
+  mutate(Date = yearmonth(Date), n_pokoje = as.numeric(n_pokoje)) %>% 
+  as_tsibble(index = Date)
+hotelarstwo_df <- hotelarstwo_df[c(1:176),]
+
+head(hotelarstwo_df)%>% 
+  select(n_pokoje, Date) %>% 
+  gt() %>% 
+  opt_stylize(style = 1, color = 'red')
+
+hotelarstwo_df %>% autoplot(n_pokoje)
+
+#opcjonalna manipulacja danymi potrzebna do tego żeby stworzyć etykiety
+#oznaczające początek roku (można pominąć)
+hotelarstwo_df<- hotelarstwo_df %>% mutate(mod_month = month(Date)-1) %>% 
+  mutate(mod_month= ifelse(mod_month ==0, year(Date), "")) %>% 
+  mutate(n_pokoje_rok = ifelse(nchar(mod_month) == 0,NA, n_pokoje))
+
+#tutaj tworzymy wykres
+hotelarstwo_df %>% autoplot(n_pokoje) +
+  ggtitle("Ilość zakwaterowanych pokoi hotelowaych na terenie Małopolski 2009-2023")+
+  geom_point(aes(y = n_pokoje_rok), colour = "red")+
+  geom_text(aes(label = mod_month), hjust = -0.2, vjust = 1)+ 
+  theme_minimal()
+
+#agregacja na poziomie roku
+stopa <- hotelarstwo_df %>% as.data.frame() %>% 
+  select(n_pokoje, Date) %>% mutate(Date = year(Date)) %>% 
+  group_by(Date) %>% summarise(Suma_pokoje = sum(n_pokoje)) %>% 
+  filter(Date == 2009 | Date == 2019)
+
+#obliczenie wskaźnika: 
+(((stopa$Suma_pokoje[2]/stopa$Suma_pokoje[1])^(1/10))-1)*100
+# wynik: 9.665774
+
+#sezonowość 
+hotelarstwo_df %>% filter(year(Date) <2020) %>%  gg_season()+
+  theme_minimal()
+
+hotelarstwo_df %>% filter(year(Date) <2020) %>% gg_subseries()
+
+#paczka do anomalii
+install.packages('anomalize')
+library(anomalize)
+
+#zamiana formatu
+anomalie_hotele <- hotelarstwo_df %>% as.tibble() %>% 
+  mutate(Date = as.Date(Date)) %>% select(Date, n_pokoje)
+
+#wizualizacja dekompozycji
+anomalie_hotele %>% 
+  time_decompose(n_pokoje, method = "stl", frequency = "auto", trend = "auto") %>% 
+  anomalize(remainder, method = "gesd", alpha = 0.00000001) %>% 
+  plot_anomaly_decomposition()
+
+#wstawiamy NA w miejsca anomalii 
+anomalie_df <- anomalie_hotele %>% 
+  time_decompose(n_pokoje, method = "stl", frequency = "auto", trend = "auto") %>% 
+  anomalize(remainder, method = "gesd", alpha = 0.00000001) %>%
+  time_recompose() %>% 
+  select(Date, observed, anomaly) %>% 
+  mutate(observed = ifelse(anomaly == "No",observed,NA)) %>% 
+  select(-anomaly) %>% rename(n_pokoje = observed) %>% 
+  as_tibble()
+
+#paczka do imputacji
+install.packages("imputeTS")
+library(imputeTS)
+
+#imputcja
+imp <- na_interpolation(anomalie_df$n_pokoje)
+anomalie_df$n_pokoje <- imp
+
+#stworzenie nowego tsibble
+hotelarstwo_df_imput <- anomalie_df %>% 
+  mutate(Date = yearmonth(Date)) %>% 
+  as_tsibble(index = Date)
+
+fit_hotele <- hotelarstwo_df_imput %>% model(m1 = ARIMA(n_pokoje), 
+                                       m2 = ETS(n_pokoje ~ error("A") + trend("Md") + season("A")), 
+                                       m3 = TSLM(box_cox(n_pokoje,0.435) ~ trend()+ season()), 
+                                       m4 = ETS(n_pokoje))
+
+fit_hotele %>% accuracy()
+
+#opcjonalna tabelka z ładnym formatowaniem
+library(gt)
+fit_hotele %>% accuracy() %>% select(.model, RMSE,MAPE,) %>% gt() %>% 
+  tab_header(
+    title = md("**RMSE i MAPE poszczególnych modeli**")
+  )
+
+fit_hotele %>% select(m1) %>% gg_tsresiduals()
+fit_hotele %>% select(m1) %>% augment() %>% 
+  features(.innov, ljung_box,lag = 18, dof = 4)
+
+fc_hotele <- fit_hotele %>% select(m1)%>% forecast(h=28)
+fc_hotele %>% filter(.model == "m1") %>% autoplot()+
+  autolayer(hotelarstwo_df)+
+  theme_minimal()+ 
+  labs(title = "Prognozowane zapotrzebowanie na usługi hotelowe (wrzesień 2023 - sierpień 2025)", 
+       x = "Data", y = "ilość pokoii")  
+
+#sredni przyrost 2022- 2025
+fc_hotele2 <- fc_hotele %>% as.data.frame() %>% 
+  select(Date, .mean) %>% rename(n_pokoje = .mean) %>% 
+  mutate(n_pokoje = round(n_pokoje,0))
+fc_hotele2
+fc_and_hotel <- hotelarstwo_df_imput %>% as.data.frame() %>% 
+  rbind(fc_hotele2)
+stopa <- fc_and_hotel %>%  mutate(Date = year(Date)) %>% group_by(Date) %>%
+  summarise(sum_pokoje = sum(n_pokoje)) %>% 
+  filter(Date == 2022 |Date == 2025)
+
+(((stopa$sum_pokoje[2]/stopa$sum_pokoje[1])^(1/4))-1)*100
+#wynik: 5.32424
+
+pt1<- fc_hotele%>% as.data.frame() %>% 
+  select(Date, .mean) %>% 
+  mutate(.mean = round(.mean,0)) %>% 
+  rename(`liczba pokoii` = .mean, Data = Date) %>% 
+  slice_head(n=14)
+pt2 <- fc_hotele%>% as.data.frame() %>% 
+  select(Date, .mean) %>% 
+  mutate(.mean = round(.mean,0)) %>% 
+  rename(`Liczba pokoii cd.` = .mean, `Data cd.` = Date) %>% 
+  slice_tail(n=14)
+final <- cbind(pt1,pt2)
+
+final %>% gt() %>% 
+  opt_stylize(style = 1, color = 'red')
